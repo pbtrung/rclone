@@ -26,15 +26,19 @@ import (
 	"github.com/rfjakob/eme"
 	"golang.org/x/crypto/nacl/secretbox"
 	"golang.org/x/crypto/scrypt"
+	"golang.org/x/crypto/hkdf"
+	"golang.org/x/crypto/sha3"
 )
 
 // Constants
 const (
 	nameCipherBlockSize = aes.BlockSize
-	fileMagic           = "RCLONE\x00\x00"
+	fileMagic           = "RCLONE\x00\x01"
 	fileMagicSize       = len(fileMagic)
 	fileNonceSize       = 24
-	fileHeaderSize      = fileMagicSize + fileNonceSize
+	fileSaltSize		= 32
+	fileKeySize			= 32
+	fileHeaderSize      = fileMagicSize + fileSaltSize
 	blockHeaderSize     = secretbox.Overhead
 	blockDataSize       = 64 * 1024
 	blockSize           = blockHeaderSize + blockDataSize
@@ -625,6 +629,33 @@ func (n *nonce) pointer() *[fileNonceSize]byte {
 	return (*[fileNonceSize]byte)(n)
 }
 
+type salt [fileSaltSize]byte
+
+func (n *salt) pointer() *[fileSaltSize]byte {
+	return (*[fileSaltSize]byte)(n)
+}
+
+type key [fileKeySize]byte
+
+func (n *key) pointer() *[fileKeySize]byte {
+	return (*[fileKeySize]byte)(n)
+}
+
+func (n *salt) fromReader(in io.Reader) error {
+	read, err := readers.ReadFill(in, (*n)[:])
+	if read != fileSaltSize {
+		return fmt.Errorf("short read of salt: %w", err)
+	}
+	return nil
+}
+
+func (n *salt) fromBuf(buf []byte) {
+	read := copy((*n)[:], buf)
+	if read != fileSaltSize {
+		panic("buffer to short to read salt")
+	}
+}
+
 // fromReader fills the nonce from an io.Reader - normally the OSes
 // crypto random number generator
 func (n *nonce) fromReader(in io.Reader) error {
@@ -683,6 +714,8 @@ type encrypter struct {
 	in       io.Reader
 	c        *Cipher
 	nonce    nonce
+	salt     salt
+	key      key
 	buf      *[blockSize]byte
 	readBuf  *[blockSize]byte
 	bufIndex int
@@ -708,10 +741,28 @@ func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
 			return nil, err
 		}
 	}
+	err := fh.salt.fromReader(c.cryptoRand)
+	if err != nil {
+		return nil, err
+	}
 	// Copy magic into buffer
 	copy((*fh.buf)[:], fileMagicBytes)
-	// Copy nonce into buffer
-	copy((*fh.buf)[fileMagicSize:], fh.nonce[:])
+	// Copy salt into buffer
+	copy((*fh.buf)[fileMagicSize:], fh.salt[:])
+
+	hash := sha3.New512
+	hkdf := hkdf.New(hash, fh.c.dataKey[:], fh.salt[:], nil)
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf, key); err != nil {
+		return nil, err
+	}
+	non := make([]byte, 24)
+	if _, err := io.ReadFull(hkdf, non); err != nil {
+		return nil, err
+	}
+	copy(fh.key[:], key)
+	copy(fh.nonce[:], non)
+
 	return fh, nil
 }
 
@@ -734,7 +785,7 @@ func (fh *encrypter) Read(p []byte) (n int, err error) {
 		// possibly err != nil here, but we will process the
 		// data and the next call to ReadFill will return 0, err
 		// Encrypt the block using the nonce
-		secretbox.Seal((*fh.buf)[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
+		secretbox.Seal((*fh.buf)[:0], readBuf[:n], fh.nonce.pointer(), fh.key.pointer())
 		fh.bufIndex = 0
 		fh.bufSize = blockHeaderSize + n
 		fh.nonce.increment()
@@ -778,6 +829,8 @@ type decrypter struct {
 	mu           sync.Mutex
 	rc           io.ReadCloser
 	nonce        nonce
+	salt         salt
+	key          key
 	initialNonce nonce
 	c            *Cipher
 	buf          *[blockSize]byte
@@ -811,9 +864,23 @@ func (c *Cipher) newDecrypter(rc io.ReadCloser) (*decrypter, error) {
 	if !bytes.Equal(readBuf[:fileMagicSize], fileMagicBytes) {
 		return nil, fh.finishAndClose(ErrorEncryptedBadMagic)
 	}
-	// retrieve the nonce
-	fh.nonce.fromBuf(readBuf[fileMagicSize:])
-	fh.initialNonce = fh.nonce
+	// retrieve the salt
+	fh.salt.fromBuf(readBuf[fileMagicSize:])
+	
+	hash := sha3.New512
+	hkdf := hkdf.New(hash, fh.c.dataKey[:], fh.salt[:], nil)
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf, key); err != nil {
+		return nil, err
+	}
+	non := make([]byte, 24)
+	if _, err := io.ReadFull(hkdf, non); err != nil {
+		return nil, err
+	}
+	copy(fh.key[:], key)
+	copy(fh.nonce[:], non)
+	copy(fh.initialNonce[:], non)
+
 	return fh, nil
 }
 
@@ -877,7 +944,7 @@ func (fh *decrypter) fillBuffer() (err error) {
 		return ErrorEncryptedFileBadHeader
 	}
 	// Decrypt the block using the nonce
-	_, ok := secretbox.Open((*fh.buf)[:0], (*readBuf)[:n], fh.nonce.pointer(), &fh.c.dataKey)
+	_, ok := secretbox.Open((*fh.buf)[:0], (*readBuf)[:n], fh.nonce.pointer(), fh.key.pointer())
 	if !ok {
 		if err != nil && err != io.EOF {
 			return err // return pending error as it is likely more accurate
