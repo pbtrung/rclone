@@ -752,11 +752,11 @@ func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
 
 	hash := sha3.New512
 	hkdf := hkdf.New(hash, fh.c.dataKey[:], fh.salt[:], nil)
-	key := make([]byte, 32)
+	key := make([]byte, fileKeySize)
 	if _, err := io.ReadFull(hkdf, key); err != nil {
 		return nil, err
 	}
-	non := make([]byte, 24)
+	non := make([]byte, fileSaltSize)
 	if _, err := io.ReadFull(hkdf, non); err != nil {
 		return nil, err
 	}
@@ -869,11 +869,11 @@ func (c *Cipher) newDecrypter(rc io.ReadCloser) (*decrypter, error) {
 	
 	hash := sha3.New512
 	hkdf := hkdf.New(hash, fh.c.dataKey[:], fh.salt[:], nil)
-	key := make([]byte, 32)
+	key := make([]byte, fileKeySize)
 	if _, err := io.ReadFull(hkdf, key); err != nil {
 		return nil, err
 	}
-	non := make([]byte, 24)
+	non := make([]byte, fileSaltSize)
 	if _, err := io.ReadFull(hkdf, non); err != nil {
 		return nil, err
 	}
